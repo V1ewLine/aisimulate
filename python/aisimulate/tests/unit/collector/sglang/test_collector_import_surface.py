@@ -328,7 +328,7 @@ _COLLECT_GEMM_DOTTED = "collector.sglang.collect_gemm"
 # collect_gemm.py does `import torch.nn.functional as F` -- needs real
 # submodule entries in sys.modules, not just attribute access on a mocked
 # `torch`, plus the separate sgl_kernel package it unconditionally imports.
-_GEMM_LENIENT_EXTRAS = ("torch.nn", "torch.nn.functional", "sgl_kernel")
+_GEMM_LENIENT_EXTRAS = ("torch.nn", "torch.nn.functional", "sgl_kernel", "flashinfer")
 
 
 class TestCollectGemmImportSurface:
@@ -337,11 +337,23 @@ class TestCollectGemmImportSurface:
     -- no prefix-code bug to reproduce here, unlike collect_moe.py."""
 
     def test_imports_cleanly_against_0514_shaped_sglang(self, monkeypatch):
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.5.14")
         _install_fake_sglang(monkeypatch, SGLANG_0514_GEMM_SURFACE, lenient_extras=_GEMM_LENIENT_EXTRAS)
         _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
 
     def test_imports_cleanly_against_0517_shaped_sglang(self, monkeypatch):
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.5.17")
         _install_fake_sglang(monkeypatch, SGLANG_0517_GEMM_SURFACE, lenient_extras=_GEMM_LENIENT_EXTRAS)
+        _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
+
+    def test_imports_cleanly_against_0519_shaped_sglang(self, monkeypatch):
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.5.19")
+        surface = {
+            **SGLANG_0517_GEMM_SURFACE,
+            "sglang.kernels.ops.gemm": {"fp8_scaled_mm": _dummy},
+            "sglang.kernels.ops.quantization": {"sgl_per_token_quant_fp8": _dummy},
+        }
+        _install_fake_sglang(monkeypatch, surface, lenient_extras=_GEMM_LENIENT_EXTRAS)
         _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
 
 

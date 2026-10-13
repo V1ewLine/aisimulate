@@ -33,8 +33,10 @@ from typing import Any
 
 import yaml
 
+from collector.case_paths import collection_case_root
+
 COLLECTOR_ROOT = Path(__file__).resolve().parent
-CASE_ROOT = COLLECTOR_ROOT / "cases"
+CASE_ROOT = collection_case_root()
 BASE_OP_CASES_DIR = CASE_ROOT / "base_ops"
 MODEL_CASES_DIR = CASE_ROOT / "models"
 _SOURCE_SYSTEMS_DIR = COLLECTOR_ROOT.parent / "src" / "aisimulate_core" / "systems"

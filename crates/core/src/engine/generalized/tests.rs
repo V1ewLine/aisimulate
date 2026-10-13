@@ -18,6 +18,7 @@ struct FakeConfig {
     same_timestamp_retry: Vec<SameTimestampRetry>,
     deadlines_ms: Vec<Option<f64>>,
     fail_execute_rank: Option<u32>,
+    fail_prepare_rank: Option<u32>,
     fail_complete_rank: Option<u32>,
     fail_internal_rank: Option<u32>,
     prepared_steps: Rc<RefCell<Vec<(u32, u64, u32)>>>,
@@ -33,6 +34,7 @@ struct FakeRank {
     same_timestamp_retry: SameTimestampRetry,
     deadlines_ms: VecDeque<f64>,
     fail_execute: bool,
+    fail_prepare: bool,
     fail_complete: bool,
     fail_internal: bool,
     prepared_steps: Rc<RefCell<Vec<(u32, u64, u32)>>>,
@@ -59,6 +61,7 @@ impl RankEngine for FakeRank {
             same_timestamp_retry: config.same_timestamp_retry[rank],
             deadlines_ms: config.deadlines_ms[rank].into_iter().collect(),
             fail_execute: config.fail_execute_rank == Some(identity.dp_rank),
+            fail_prepare: config.fail_prepare_rank == Some(identity.dp_rank),
             fail_complete: config.fail_complete_rank == Some(identity.dp_rank),
             fail_internal: config.fail_internal_rank == Some(identity.dp_rank),
             prepared_steps: Rc::clone(&config.prepared_steps),
@@ -121,6 +124,13 @@ impl RankEngine for FakeRank {
             start_effects: "started",
             pending: "pending",
         })
+    }
+
+    fn prepare_group_prefill(&mut self, _now_ms: f64) -> Result<bool> {
+        if self.fail_prepare {
+            bail!("injected prepare failure on rank {}", self.identity.dp_rank);
+        }
+        Ok(false)
     }
 
     fn complete_pass(
@@ -387,6 +397,7 @@ fn config(
             same_timestamp_retry: vec![SameTimestampRetry::NotApplicable; deadlines_ms.len()],
             deadlines_ms,
             fail_execute_rank: None,
+            fail_prepare_rank: None,
             fail_complete_rank: None,
             fail_internal_rank: None,
             prepared_steps: Rc::new(RefCell::new(Vec::new())),
@@ -772,6 +783,36 @@ fn internal_work_waits_for_the_group_pass_boundary() -> Result<()> {
     );
     assert!(log.borrow().contains(&"internal:0:false".to_string()));
     assert!(log.borrow().contains(&"internal:1:false".to_string()));
+    Ok(())
+}
+
+#[test]
+fn prefill_preparation_failure_poisons_group_before_any_rank_decodes() -> Result<()> {
+    let (mut rank, log) = config(vec![true, true], vec![1.0, 1.0], vec![None, None]);
+    rank.fail_prepare_rank = Some(1);
+    let mut engine = GeneralizedMockerEngine::<FakeRank>::new(
+        EngineIdentity::new(40),
+        GeneralizedEngineConfig::attention_dp(NonZeroU32::new(2).unwrap(), rank),
+    )?;
+    let error = format!("{:#}", engine.execute_pass(0.0).unwrap_err());
+    assert!(error.contains("now poisoned"), "{error}");
+    assert!(
+        error.contains("injected prepare failure on rank 1"),
+        "{error}"
+    );
+    assert!(
+        log.borrow().is_empty(),
+        "decode must not run before phase selection completes"
+    );
+    assert!(!engine.is_ready());
+    assert!(!engine.is_drained());
+    assert!(
+        engine
+            .execute_pass(1.0)
+            .unwrap_err()
+            .to_string()
+            .contains("is poisoned")
+    );
     Ok(())
 }
 

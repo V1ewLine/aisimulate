@@ -108,6 +108,12 @@ class ParallelismPredictionConfig(ParallelismPresetConfig):
 class SchedulerPredictionConfig(StrictModel):
     max_batched_tokens: PositiveInt = 8192
     max_sequences: PositiveInt = 256
+    chunked_prefill_size: PositiveInt | None = Field(
+        default=None, description="SGLang only: prompt chunk budget before division by attention DP."
+    )
+    max_prefill_tokens: PositiveInt | None = Field(
+        default=None, description="SGLang only: page-rounded prefill-token budget per attention-DP rank."
+    )
     prefill_schedule_interval: PositiveInt = Field(
         default=1, description="vLLM only: admit prefill once every N attention-DP group passes."
     )
@@ -926,6 +932,8 @@ def _validate_prediction_scheduler_backend(engine: EnginePredictionConfig) -> No
         for field, backend, default in (
             ("prefill_schedule_interval", "vllm", 1),
             ("prefill_decode_interval", "sglang", 0),
+            ("chunked_prefill_size", "sglang", None),
+            ("max_prefill_tokens", "sglang", None),
         ):
             if engine.backend != backend and getattr(worker.scheduler, field) != default:
                 raise ValueError(f"workers.{role}.scheduler.{field} is supported only for backend={backend}")

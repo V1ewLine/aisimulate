@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# 相对路径均以本 YAML 所在目录为基准。
+output_dir: ../../../../benchmarks/evidence/glm52-b300-tune/yaml-search
+
+search:
+  concurrency: [16, 32, 64]
+  dp_ep: [[2, 2]] # [Attention DP, MoE EP]；总 GPU 数由 prediction 固定
+  chunked_prefill_size: [8192, 16384, 32768, 65536] # 全局值，运行时除以 DP
+  max_prefill_tokens: [16384, 65536, 458752] # 每个 DP rank，不再除以 DP
+  # max_sequences: [128, 256] # 每个 DP rank；省略则沿用 prediction
+  # memory_fraction: [0.80, 0.85] # 仅适用于 capacity.type: default
+
+workload:
+  requests_per_concurrency: 4 # 总请求数 = 并发 × 4；trace 取前 N 条，不循环补齐
+metrics:
+  ttft_scope: all # first_batch 首批 C 条 TTFT；all 表示全量 TTFT
+  # TPOT 和输入/输出/总吞吐始终使用全部 N 条请求。
+slo:
+  ttft_p50_ms: 15000
+  tpot_p50_ms: 33
+run:
+  jobs: 2 # 同时运行的 CPU 仿真数
+  timeout_seconds: 300
+
+# 此块就是普通 predict YAML 的内容，可整体替换。
+prediction:
+  traffic:
+    source:
+      type: trace
+      paths: [/loong/run/aisimulate/workload-prefix90.jsonl]
+      format: mooncake
+      block_size: 1000
+    load:
+      type: concurrency
+      concurrency: 32
+  engine:
+    mode: aggregated
+    model: nvidia/GLM-5.2-NVFP4
+    hardware: b300_sxm
+    backend: sglang
+    backend_version: "0.5.17"
+    context_length: 131072
+    nextn: 3
+    nextn_accepted: 1.11 # 沿用 100K trace 的假设；不是 32K 实测的接受草稿数
+    workers:
+      aggregated:
+        parallelism:
+          replicas: 1
+          tensor: 4
+          pipeline: 1
+          attention_data: 2
+          moe_tensor: 4
+          moe_expert: 2
+        scheduler:
+          chunked_prefill_size: 32768
+          max_prefill_tokens: 458752
+          max_batched_tokens: 16384
+          max_sequences: 256
+        kv_cache:
+          prefix_caching: true
+          block_size: 64
+          capacity:
+            type: default
+            memory_fraction: 0.80
+  evaluation:
+    sla:
+      ttft_ms: 15000
+      itl_ms: 33

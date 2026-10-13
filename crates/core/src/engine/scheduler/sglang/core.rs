@@ -10,6 +10,11 @@
 //! https://github.com/sgl-project/sglang/blob/20621aa14bda7726a8a968f326198eac61717fef/python/sglang/srt/managers/scheduler.py
 //! (`_should_defer_prefill`, `_arm_prefill_decode_interval`, `get_next_batch_to_run`).
 //! This countdown and group feedback integration are independently implemented.
+//!
+//! Speculative attention-DP phase selection also follows `get_next_batch_to_run`
+//! at sgl-project/sglang commit 096a38576a26d7cee1b783e6c42805f89376769f
+//! (`python/sglang/srt/managers/scheduler.py`): select prefill on every rank
+//! before allowing decode. This two-stage simulation is independently implemented.
 
 use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
@@ -34,11 +39,11 @@ use crate::engine::{HandoffId, modeled_duration_ms};
 
 use super::config::SglangConfig;
 use super::decode::{
-    cache_materialized_prefix, cleanup_completed_request, simulate_decode_step_with_sampler,
-    simulate_prefill_first_tokens,
+    DecodeResult, cache_materialized_prefix, cleanup_completed_request,
+    simulate_decode_step_with_sampler, simulate_prefill_first_tokens,
 };
 use super::policy::apply_schedule_policy;
-use super::prefill::get_new_batch_prefill;
+use super::prefill::{PrefillFpmItem, get_new_batch_prefill};
 use super::request::{SglangRequest, WaitingQueue};
 use crate::engine::scheduler::{
     ActiveHandoffRequests, AdmissionInvariant, AdmissionStage, CapturedKvEventBuffer,
@@ -73,6 +78,23 @@ pub(crate) struct SglangCore {
     prefill_in_pass: bool,
     model_work_in_pass: bool,
     interval_idle_in_pass: bool,
+    prepared_prefill: Option<PreparedPrefill>,
+}
+
+/// Owned admission results retained only between group phase selection and
+/// execution. Reuses the existing pass vectors; never clones scheduler state.
+struct PreparedPrefill {
+    grouped: bool,
+    defer_prefill: bool,
+    remaining_after_round: usize,
+    new_token_ratio_before: f64,
+    rejected: Vec<(usize, SglangRequest)>,
+    admissions: Vec<crate::engine::scheduler::AdmissionEvent>,
+    committed_requests: Vec<Uuid>,
+    prefill_fpm: Vec<PrefillFpmItem>,
+    previously_running: usize,
+    prefill_pass: bool,
+    prefill_time: Duration,
 }
 
 struct HeldSglangPrefill {
@@ -223,6 +245,7 @@ impl SglangCore {
             prefill_in_pass: false,
             model_work_in_pass: false,
             interval_idle_in_pass: false,
+            prepared_prefill: None,
             #[cfg(test)]
             destination_reservation_attempts: 0,
             lifecycle_events: Vec::new(),
@@ -630,7 +653,10 @@ impl SglangCore {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.waiting.is_empty() && self.prebuilt_ready.is_empty() && self.running.is_empty()
+        self.prepared_prefill.is_none()
+            && self.waiting.is_empty()
+            && self.prebuilt_ready.is_empty()
+            && self.running.is_empty()
     }
 
     #[allow(dead_code)]
@@ -795,6 +821,24 @@ impl SglangCore {
         self.try_execute_pass_internal(None, now_ms)
     }
 
+    pub(crate) fn prepare_group_prefill(&mut self) -> anyhow::Result<bool> {
+        debug_assert!(self.prepared_prefill.is_none());
+        self.prepared_prefill = Some(self.prepare_prefill()?);
+        Ok(self.prefill_in_pass)
+    }
+
+    pub(crate) fn try_execute_group_pass(
+        &mut self,
+        now_ms: f64,
+        any_rank_prefilled: bool,
+    ) -> anyhow::Result<EnginePassResult> {
+        let prepared = match self.prepared_prefill.take() {
+            Some(prepared) => prepared,
+            None => self.prepare_prefill()?,
+        };
+        self.execute_prepared_pass(None, now_ms, prepared, any_rank_prefilled)
+    }
+
     #[cfg(test)]
     pub(super) fn execute_pass_internal(
         &mut self,
@@ -807,9 +851,14 @@ impl SglangCore {
 
     pub(super) fn try_execute_pass_internal(
         &mut self,
-        mut collector: Option<&mut TraceCollector>,
+        collector: Option<&mut TraceCollector>,
         now_ms: f64,
     ) -> anyhow::Result<EnginePassResult> {
+        let prepared = self.prepare_prefill()?;
+        self.execute_prepared_pass(collector, now_ms, prepared, false)
+    }
+
+    fn prepare_prefill(&mut self) -> anyhow::Result<PreparedPrefill> {
         let grouped = std::mem::take(&mut self.group_pass_prepared);
         let defer_prefill = self.prefill_rounds_remaining > 0;
         let remaining_after_round = self.prefill_rounds_remaining.saturating_sub(1);
@@ -958,16 +1007,11 @@ impl SglangCore {
         };
 
         admissions.append(&mut admit.admissions);
-        for admission in &admissions {
-            if let Some(collector) = collector.as_deref_mut() {
-                collector.on_admit(admission.uuid, now_ms, admission.reused_input_tokens);
-            }
-        }
 
         // Retain chunks that computed input even when no output token is emitted.
         // Cache-only completions do not share a cold sibling's in-flight work.
         debug_assert_eq!(admit.can_run.len(), admit.prefill_fpm.len());
-        let mut committed_requests: Vec<_> = admit
+        let committed_requests: Vec<_> = admit
             .can_run
             .iter()
             .zip(&admit.prefill_fpm)
@@ -1002,11 +1046,56 @@ impl SglangCore {
         let prefill_pass = batch_size > 0;
         // A fully cached, zero-output request can complete without a forward.
         self.prefill_in_pass = prefill_fpm.iter().any(|item| item.tokens_computed > 0);
+        Ok(PreparedPrefill {
+            grouped,
+            defer_prefill,
+            remaining_after_round,
+            new_token_ratio_before,
+            rejected,
+            admissions,
+            committed_requests,
+            prefill_fpm,
+            previously_running,
+            prefill_pass,
+            prefill_time,
+        })
+    }
+
+    fn execute_prepared_pass(
+        &mut self,
+        mut collector: Option<&mut TraceCollector>,
+        now_ms: f64,
+        prepared: PreparedPrefill,
+        any_rank_prefilled: bool,
+    ) -> anyhow::Result<EnginePassResult> {
+        let PreparedPrefill {
+            grouped,
+            defer_prefill,
+            remaining_after_round,
+            new_token_ratio_before,
+            rejected,
+            admissions,
+            mut committed_requests,
+            prefill_fpm,
+            previously_running,
+            prefill_pass,
+            prefill_time,
+        } = prepared;
+        for admission in &admissions {
+            if let Some(collector) = collector.as_deref_mut() {
+                collector.on_admit(admission.uuid, now_ms, admission.reused_input_tokens);
+            }
+        }
+        // A sibling's prefill makes this rank run IDLE instead of speculative
+        // decode. Keep its running requests intact, without consuming sampler
+        // state, allocating decode KV, or decaying the admission ratio.
+        let idle_for_peer_prefill = any_rank_prefilled && !prefill_pass;
         let mut stalled: Vec<SglangRequest> = if prefill_pass && previously_running > 0 {
             self.running.drain(..previously_running).collect()
         } else {
             Vec::new()
         };
+        let prefill_pass = prefill_pass || any_rank_prefilled;
 
         // Capture scheduled decode data before the decode step modifies running. A prefill-first
         // pass is a pure prefill forward: nothing is scheduled for decode.
@@ -1022,7 +1111,14 @@ impl SglangCore {
         self.interval_idle_in_pass = defer_prefill && scheduled_decode_lens.is_empty();
 
         let decode_start_ms = now_ms + prefill_time.as_secs_f64() * 1000.0;
-        let decode = if prefill_pass {
+        let decode = if idle_for_peer_prefill {
+            // No local work: leave the running vector in place instead of
+            // moving every request out and back on each peer prefill chunk.
+            Ok(DecodeResult {
+                end_ms: decode_start_ms,
+                ..DecodeResult::default()
+            })
+        } else if prefill_pass {
             simulate_prefill_first_tokens(
                 &mut self.running,
                 &mut self.kv_manager,

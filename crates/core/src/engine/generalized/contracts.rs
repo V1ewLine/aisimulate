@@ -300,6 +300,26 @@ pub trait RankEngine: Sized {
     /// default is a no-op for rank engines without group-step scheduling.
     fn prepare_group_pass(&mut self, _wave_step: u64, _dp_size: NonZeroU32) {}
 
+    /// Select local prefill work before any rank advances decode. Backends that
+    /// require a common forward phase retain their selection until
+    /// `execute_group_pass` and return whether it includes actual prefill work.
+    /// Preparation must keep the rank ready even if only terminal effects remain.
+    /// As with `execute_pass`, a failure poisons the group; no commands or effects
+    /// are interleaved between preparation and execution.
+    fn prepare_group_prefill(&mut self, _now_ms: f64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Execute using the prefill decision from all participating ranks. The
+    /// default preserves independent phase selection for other backends.
+    fn execute_group_pass(
+        &mut self,
+        now_ms: f64,
+        _any_rank_prefilled: bool,
+    ) -> Result<RankPass<Self::PassStartEffects, Self::PendingPass>> {
+        self.execute_pass(now_ms)
+    }
+
     /// Whether this rank scheduled an EXTEND/prefill in the prepared pass.
     /// Reset the observation in `prepare_group_pass`, including for idle ranks.
     /// Only backends that consume synchronized prefill feedback need report it.

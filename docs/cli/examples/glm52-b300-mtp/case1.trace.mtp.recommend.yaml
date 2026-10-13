@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+# 用例 1：回放已有 100K 输入 / 90K 共享前缀 / 1K 输出的 trace。
+# MTP 搜索示例：需要当前源码构建的 AISimulate；已安装的 0.12.0 不接受 MTP 字段。
+# 接受草稿数沿用原用例假设 1.11，尚未按同一 100K workload 重新测量。
+# 混合 TP/DP 布局、CP 与原生 chunk/prefill 预算仍不能在此搜索。
+traffic:
+  source:
+    type: trace
+    paths: [/loong/run/aisimulate/workload-prefix90.jsonl]
+    format: mooncake
+    block_size: 1000 # 必须与 build_data.py 的 TRACE_BLOCK_SIZE 一致
+  load:
+    type: concurrency
+    concurrency:
+      choices: [16, 32, 48, 64, 80, 96, 112, 128]
+
+engine:
+  mode: aggregated
+  model: nvidia/GLM-5.2-NVFP4
+  hardware: b300_sxm
+  backend: sglang
+  backend_version: "0.5.17" # 沿用已有 one_node_b300.yaml 的版本
+  context_length: max
+  nextn: 3
+  nextn_accepted: 1.11 # 每轮平均接受的草稿数；不是接受概率，也不含保底 token
+  workers:
+    aggregated:
+      parallelism:
+        # 在合法并行布局池中搜索副本数、TP、Attention DP、MoE TP 和 EP。
+        # 默认 PP=1；总 GPU 数仍由下方 constraints 限定为 8。
+        # 当前候选池不包含全局 TP8 / DP2 / EP2；增加 max_trials 不能补齐。
+        preset: default
+      scheduler:
+        # 当前 SGLang 调度器的 chunk / prefill 预算另有独立字段。
+        # 本字段参与容量估算，不等价于 chunked_prefill_size / max_prefill_tokens。
+        max_batched_tokens:
+          choices: [2048, 3072, 4096, 6144, 8192, 12288, 16384, 20480, 24576, 28672, 32768]
+        max_sequences:
+          choices: [16, 32, 64, 128, 256, 512]
+      kv_cache:
+        prefix_caching: true
+        block_size: # KV 页大小，与 trace 的 block_size 不是同一参数
+          choices: [64]
+        capacity:
+          type: default
+          memory_fraction:
+            choices: [0.80, 0.85, 0.88, 0.90]
+
+evaluation:
+  sla:
+    ttft_ms: 15000
+    itl_ms: 33
+
+optimization:
+  target: throughput
+  # 内置 strict_sla 按均值筛选。保留候选后，按请求 TPOT/TTFT 的 P50 筛选。
+  strict_sla: false
+  constraints:
+    min_candidate_gpus: 8
+    max_candidate_gpus: 8
+
+optimizer:
+  algorithm: random
+  max_trials: 1000 # 尝试预算，不保证遍历所有组合
+  parallelism: 16 # 本机同时运行的仿真数量，与目标 8 张 GPU 无关
+  seed: 42

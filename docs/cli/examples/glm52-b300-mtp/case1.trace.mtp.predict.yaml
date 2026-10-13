@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# 固定配置回放：8×B300、全局 TP8 / Attention DP2 / EP2、并发 32。
+# 使用已有 1024 请求 trace：100000 输入 / 90000 共享前缀 / 1000 输出。
+# 从冷缓存开始回放；共享前缀不代表每条请求都保证命中 90000 token。
+traffic:
+  source:
+    type: trace
+    paths: [/loong/run/aisimulate/workload-prefix90.jsonl]
+    format: mooncake
+    block_size: 1000 # trace hash 的粒度，不是 KV 页大小
+  load:
+    type: concurrency
+    concurrency: 128
+
+engine:
+  mode: aggregated
+  model: nvidia/GLM-5.2-NVFP4
+  hardware: b300_sxm
+  backend: sglang
+  backend_version: "0.5.17" # 使用已有性能数据；不代表已校准 SGLang 0.5.19
+  context_length: 131072
+  nextn: 3
+  nextn_accepted: 1.11 # 沿用原 100K 用例假设，需用同一 workload 的实测值校准
+  workers:
+    aggregated:
+      parallelism:
+        replicas: 1
+        tensor: 4 # 每个 Attention DP rank 的 TP；4 × 2 = 全局 TP8
+        pipeline: 1
+        attention_data: 2
+        moe_tensor: 4
+        moe_expert: 2
+      scheduler:
+        chunked_prefill_size: 32768 # 原始值；运行时除以 DP2，每 rank 16384
+        max_prefill_tokens: 458752 # 每个 Attention DP rank 的预算，不再除以 DP
+        max_batched_tokens: 16384 # 容量估算使用的每 rank token 预算，需与 chunk 配套调整
+        max_sequences: 256 # 每个 Attention DP rank 的运行请求数上限
+      kv_cache:
+        prefix_caching: true
+        block_size: 64
+        capacity:
+          type: default
+          memory_fraction: 0.80
+
+evaluation:
+  sla:
+    ttft_ms: 15000
+    itl_ms: 33

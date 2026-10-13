@@ -606,6 +606,15 @@ def _worker_engine_args(
         "enable_prefix_caching": cache.prefix_caching,
         "startup_time": worker.startup_seconds,
     }
+    sglang_scheduler = {
+        name: value
+        for name in ("chunked_prefill_size", "max_prefill_tokens")
+        if (value := getattr(worker.scheduler, name)) is not None
+    }
+    if sglang_scheduler:
+        # Keep native defaults in Rust and let the rank launcher divide the
+        # chunk budget by attention DP exactly once.
+        payload["sglang"] = sglang_scheduler
     if engine.speculation is not None:
         payload["speculation"] = engine.speculation.model_dump(mode="json")
     if engine.backend_version is not None:

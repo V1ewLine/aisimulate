@@ -48,6 +48,12 @@ _MODEL_CASES_DIR = "collector/cases/models"
 # authored collector_hash closures.
 STANDALONE_COLLECTOR_MODULES: frozenset[str] = frozenset(
     {
+        # Shared implementations remain callable by the legacy standalone
+        # scripts, while the stock registry uses explicit v1/v2 adapters.
+        "collector.sglang.collect_gemm",
+        "collector.sglang.collect_moe",
+        "collector.sglang.collect_mla_module",
+        "collector.sglang.glm5_dsa_sparse_modules",
         "collector.sglang.collect_dsv4_megamoe",
         "collector.sglang.dsv41_attention_runner",
         "collector.sglang.dsv41_isolated_runner",

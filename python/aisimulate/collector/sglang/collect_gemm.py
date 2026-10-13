@@ -59,14 +59,20 @@ import random
 # Set it before any SGLang imports so a task compiles only its requested M.
 os.environ.setdefault("SGLANG_JIT_DEEPGEMM_PRECOMPILE", "0")
 
-import pkg_resources
+from importlib.metadata import version as get_version
+
 import torch
 import torch.nn.functional as F
 from collector.case_generator import get_gemm_case_specs
-from sgl_kernel import (
-    fp8_scaled_mm,
-    sgl_per_token_quant_fp8,
-)
+from packaging.version import Version
+
+if Version(get_version("sglang")) >= Version("0.5.19"):
+    # v0.5.19 public kernel namespace; the BF16 collector only needs to
+    # resolve these names. Quantized calls remain lazy upstream.
+    from sglang.kernels.ops.gemm import fp8_scaled_mm
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+else:
+    from sgl_kernel import fp8_scaled_mm, sgl_per_token_quant_fp8
 
 try:
     from flashinfer import fp4_quantize as flashinfer_fp4_quantize
@@ -451,7 +457,7 @@ def run_gemm(gemm_type, batch_size, N, K, *, perf_filename, device="cuda:0"):  #
                 {"gemm_dtype": gemm_type, "m": M, "n": N, "k": K, "latency": results["latency_ms"] / len(op_list)}
             ],
             framework="SGLang",
-            version=pkg_resources.get_distribution("sglang").version,
+            version=get_version("sglang"),
             device_name=torch.cuda.get_device_name(device),
             op_name="gemm",
             kernel_source=kernel_source,

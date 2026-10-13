@@ -39,8 +39,11 @@ class CollectorRuntime:
     data_backend: str | None = None
     family: str | None = None  # set when resolved per-op with the catalog present
     workload: str = "default"
+    execution: str = "container"
 
     def image(self, variant: str = "default") -> str:
+        if self.execution == "local_python":
+            raise ValueError("This runtime is a local Python environment, not a container image")
         return self.images.get(variant) or self.images["default"]
 
     def abi_for_backend(self, backend: str) -> dict[str, str]:
@@ -111,7 +114,8 @@ def _runtime_from_spec(
     return CollectorRuntime(
         framework=framework_key,
         version=runtime_spec["version"],
-        images=dict(runtime_spec["images"]),
+        images=dict(runtime_spec.get("images") or {}),
+        execution=runtime_spec.get("execution", "container"),
         source_commit=runtime_spec.get("source_commit"),
         abi=dict(runtime_spec["abi"]) if runtime_spec.get("abi") else None,
         backend_abi=(
@@ -212,6 +216,7 @@ def _runtime_identity(runtime: CollectorRuntime) -> tuple:
     return (
         runtime.version,
         tuple(sorted(runtime.images.items())),
+        runtime.execution,
         runtime.source_commit,
         tuple(sorted((runtime.abi or {}).items())),
         tuple((backend, tuple(sorted(abi.items()))) for backend, abi in sorted((runtime.backend_abi or {}).items())),
@@ -309,9 +314,14 @@ def require_collector_runtime(
     expected_public = Version(runtime.version).public
     if installed_public != expected_public:
         workload = "WideEP" if runtime.workload == "wideep" else "stock"
+        target = (
+            f"a local Python environment with {framework}=={runtime.version}"
+            if runtime.execution == "local_python"
+            else runtime.image()
+        )
         raise RuntimeError(
             f"{framework} {workload} collector requires exactly {runtime.version}, found {installed_version}; "
-            f"use {runtime.image()}"
+            f"use {target}"
         )
     return runtime
 
@@ -393,8 +403,15 @@ def _validate_runtime_spec(name: str, spec: object) -> None:
         raise TypeError(f"{name} must be a mapping")
     if not isinstance(spec.get("version"), str) or not spec["version"]:
         raise ValueError(f"{name}.version is required")
-    images = spec.get("images")
-    if not isinstance(images, dict) or not images.get("default"):
+    execution = spec.get("execution", "container")
+    if execution not in {"container", "local_python"}:
+        raise ValueError(f"{name}.execution must be container or local_python")
+    images = spec.get("images") or {}
+    if not isinstance(images, dict):
+        raise ValueError(f"{name}.images must be a mapping")
+    if execution == "local_python" and images:
+        raise ValueError(f"{name}: local_python must not claim a container image")
+    if execution == "container" and (not isinstance(images, dict) or not images.get("default")):
         raise ValueError(f"{name}.images.default is required")
     if not all(isinstance(key, str) and isinstance(value, str) and value for key, value in images.items()):
         raise ValueError(f"{name}.images must map image variants to non-empty strings")

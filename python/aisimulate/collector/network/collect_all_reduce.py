@@ -755,9 +755,17 @@ def benchmark_sglang_allreduce(
         def __init__(self):
             self.enable_symm_mem = False
 
-    from sglang.srt.server_args import set_global_server_args_for_scheduler
+    from importlib.metadata import version
 
-    set_global_server_args_for_scheduler(MockServerArgs())
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    if version("sglang") == "0.5.19":
+        # 0.5.19 publishes all resolved config bags, so a one-field mock no
+        # longer represents serving initialization (server_args.py:4229).
+        server_args = ServerArgs(model_path="dummy", enable_symm_mem=False)
+    else:
+        server_args = MockServerArgs()
+    set_global_server_args_for_scheduler(server_args)
 
     """Benchmark SGLang custom AllReduce implementation"""
     sglang_mods, local_rank = setup_sglang_distributed(world_size, rank, use_slurm)

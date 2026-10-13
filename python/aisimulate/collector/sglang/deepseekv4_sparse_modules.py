@@ -843,10 +843,12 @@ def _sglang_chunked_prefill_size():
     if _CHUNKED_PREFILL is None:
         try:
             from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
-            from sglang.srt.server_args import ServerArgs, get_device_memory_capacity
+            from sglang.srt.server_args import ServerArgs
+            from sglang.srt.utils import get_device_memory_capacity
         except ModuleNotFoundError:
             from srt.model_executor.cuda_graph_config import default_cuda_graph_config
-            from srt.server_args import ServerArgs, get_device_memory_capacity
+            from srt.server_args import ServerArgs
+            from srt.utils import get_device_memory_capacity
         gpu_mem = None
         try:
             gpu_mem = get_device_memory_capacity("cuda")

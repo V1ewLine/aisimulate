@@ -62,6 +62,11 @@ frameworks:
     # runtime; run these model-pinned campaigns separately at their declared
     # runtime rather than mixing them into an unfiltered invocation.
     models:
+      # Local conda collection requested for GLM-5.2 / B300. This declares no
+      # container image: the campaign captures installed packages/source hashes.
+      "nvidia/GLM-5.2-NVFP4":
+        version: "0.5.19"
+        execution: local_python
       "Qwen/Qwen3.8-2.4T-A95B":
         version: "0.5.17"
         images:

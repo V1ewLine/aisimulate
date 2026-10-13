@@ -558,6 +558,161 @@ fn assert_interval_work(round: &IntervalRound, rank: usize, prefill: u32, decode
     );
 }
 
+fn sglang_speculative_config() -> EngineConfig {
+    let mut config = sglang_interval_config(0);
+    config.aic_nextn = Some(3);
+    config.aic_nextn_accept_rates = Some("1,1,1".to_string());
+    config
+}
+
+#[test]
+fn sglang_speculative_dp_stalls_decode_until_all_prefill_chunks_finish() {
+    for dp_size in [2, 4] {
+        for short_rank in [0, dp_size - 1] {
+            let long_rank = dp_size - 1 - short_rank;
+            let mut engine = sglang_interval_engine(sglang_speculative_config(), dp_size);
+            let mut now_ms = 0.0;
+            submit_interval_request(&mut engine, short_rank, 1, 4, 5, now_ms);
+            submit_interval_request(&mut engine, long_rank, 2, 12, 5, now_ms);
+
+            let first = step_interval_engine(&mut engine, &mut now_ms);
+            assert_eq!(first.ranks[short_rank as usize].outputs.len(), 1);
+            assert!(first.ranks[long_rank as usize].outputs.is_empty());
+            let short_blocks = first.ranks[short_rank as usize].metrics.active_blocks;
+            for chunk in 1..3 {
+                let round = step_interval_engine(&mut engine, &mut now_ms);
+                assert_interval_work(&round, short_rank as usize, 0, 0);
+                assert_interval_work(&round, long_rank as usize, 1, 0);
+                assert!(round.ranks[short_rank as usize].outputs.is_empty());
+                assert_eq!(
+                    round.ranks[short_rank as usize].metrics.active_blocks,
+                    short_blocks
+                );
+                assert_eq!(
+                    round.ranks[long_rank as usize].outputs.len(),
+                    usize::from(chunk == 2)
+                );
+                assert_eq!(round.duration_ms, 7.0);
+            }
+            let decode = step_interval_engine(&mut engine, &mut now_ms);
+            for rank in [short_rank, long_rank] {
+                assert_interval_work(&decode, rank as usize, 0, 1);
+                assert_eq!(decode.ranks[rank as usize].outputs.len(), 4);
+                assert!(
+                    decode.ranks[rank as usize]
+                        .outputs
+                        .last()
+                        .unwrap()
+                        .completed
+                );
+            }
+            assert_eq!(now_ms, 23.0);
+            assert!(engine.is_drained());
+        }
+    }
+}
+
+#[test]
+fn sglang_non_speculative_dp_preserves_independent_phase_selection() {
+    let mut engine = sglang_interval_engine(sglang_interval_config(0), 2);
+    let mut now_ms = 0.0;
+    submit_interval_request(&mut engine, 0, 1, 4, 5, now_ms);
+    submit_interval_request(&mut engine, 1, 2, 12, 5, now_ms);
+    step_interval_engine(&mut engine, &mut now_ms);
+    let second = step_interval_engine(&mut engine, &mut now_ms);
+    assert_interval_work(&second, 0, 0, 1);
+    assert_interval_work(&second, 1, 1, 0);
+    assert_eq!(second.ranks[0].outputs.len(), 1);
+}
+
+#[test]
+fn sglang_speculative_dp_queued_but_blocked_prefill_does_not_stall_decode() {
+    let mut config = sglang_speculative_config();
+    config.max_num_seqs = 1;
+    let mut engine = sglang_interval_engine(config, 2);
+    let mut now_ms = 0.0;
+    for rank in 0..2 {
+        submit_interval_request(&mut engine, rank, rank as u128 + 1, 4, 5, now_ms);
+    }
+    step_interval_engine(&mut engine, &mut now_ms);
+    submit_interval_request(&mut engine, 1, 3, 4, 1, now_ms);
+    let decode = step_interval_engine(&mut engine, &mut now_ms);
+    for rank in 0..2 {
+        assert_interval_work(&decode, rank, 0, 1);
+        assert!(decode.ranks[rank].outputs.last().unwrap().completed);
+    }
+    let resumed = step_interval_engine(&mut engine, &mut now_ms);
+    assert_interval_work(&resumed, 1, 1, 0);
+    assert_eq!(resumed.ranks[1].outputs[0].request_id, Uuid::from_u128(3));
+    assert!(engine.is_drained());
+}
+
+#[test]
+fn sglang_speculative_dp_cache_only_completion_does_not_stall_decode() {
+    let mut config = sglang_speculative_config();
+    config.enable_prefix_caching = true;
+    let mut engine = sglang_interval_engine(config, 2);
+    let mut now_ms = 0.0;
+    submit_interval_request(&mut engine, 1, 2, 4, 0, now_ms);
+    step_interval_engine(&mut engine, &mut now_ms);
+    submit_interval_request(&mut engine, 0, 1, 4, 5, now_ms);
+    step_interval_engine(&mut engine, &mut now_ms);
+    engine
+        .apply_command_effects(
+            SchedulerCommand::new(
+                1,
+                Command::Submit(Request {
+                    request_id: Uuid::from_u128(3),
+                    tokens: vec![2; 4],
+                    max_output_tokens: 0,
+                    output_token_ids: None,
+                }),
+            ),
+            now_ms,
+        )
+        .unwrap();
+    let round = step_interval_engine(&mut engine, &mut now_ms);
+    assert_interval_work(&round, 0, 0, 1);
+    assert_interval_work(&round, 1, 0, 0);
+    assert_eq!(round.ranks[1].metrics.sglang_cache_hit_tokens, 4);
+    assert!(round.ranks[1].outputs[0].completed);
+    assert!(round.ranks[0].outputs.last().unwrap().completed);
+    assert!(engine.is_drained());
+}
+
+#[test]
+fn sglang_speculative_dp_retains_rejections_after_phase_selection() {
+    let mut config = sglang_speculative_config();
+    config.max_model_len = Some(8);
+    let mut engine = sglang_interval_engine(config, 2);
+    let mut now_ms = 0.0;
+    submit_interval_request(&mut engine, 1, 1, 8, 5, now_ms);
+    let round = step_interval_engine(&mut engine, &mut now_ms);
+    assert_eq!(round.ranks[1].outputs.len(), 1);
+    assert!(round.ranks[1].outputs[0].rejected);
+    assert!(round.ranks[1].outputs[0].completed);
+    assert_eq!(now_ms, 0.0);
+    assert!(engine.is_drained());
+}
+
+#[test]
+fn sglang_speculative_dp_interval_allows_decode_between_prefill_rounds() {
+    let mut config = sglang_speculative_config();
+    config.prefill_decode_interval = 1;
+    let mut engine = sglang_interval_engine(config, 2);
+    let mut now_ms = 0.0;
+    submit_interval_request(&mut engine, 0, 1, 4, 9, now_ms);
+    submit_interval_request(&mut engine, 1, 2, 12, 1, now_ms);
+    step_interval_engine(&mut engine, &mut now_ms);
+    let decode = step_interval_engine(&mut engine, &mut now_ms);
+    assert_interval_work(&decode, 0, 0, 1);
+    assert_interval_work(&decode, 1, 0, 0);
+    let prefill = step_interval_engine(&mut engine, &mut now_ms);
+    assert_interval_work(&prefill, 0, 0, 0);
+    assert_interval_work(&prefill, 1, 1, 0);
+    assert!(prefill.ranks[0].outputs.is_empty());
+}
+
 #[test]
 fn sglang_split_prefixes_remain_reusable_across_cache_pressure() {
     let mut config = sglang_interval_config(0);

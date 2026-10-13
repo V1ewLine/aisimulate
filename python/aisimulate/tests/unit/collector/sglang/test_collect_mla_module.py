@@ -186,8 +186,9 @@ class TestDsaRuntimeLimits:
 
 
 class TestDsaCudaGraph:
-    def test_generation_cuda_graph_uses_max_batch_tokens(self):
+    def test_generation_cuda_graph_uses_max_batch_tokens(self, monkeypatch):
         mod = _import_module()
+        monkeypatch.setattr(mod, "get_version", lambda _: "0.5.14")
         runner = types.SimpleNamespace(
             server_args=types.SimpleNamespace(
                 cuda_graph_config=types.SimpleNamespace(
@@ -199,8 +200,9 @@ class TestDsaCudaGraph:
         assert mod._generation_cuda_graph_enabled_for_tokens(runner, 256)
         assert not mod._generation_cuda_graph_enabled_for_tokens(runner, 257)
 
-    def test_generation_cuda_graph_uses_explicit_batch_list(self):
+    def test_generation_cuda_graph_uses_explicit_batch_list(self, monkeypatch):
         mod = _import_module()
+        monkeypatch.setattr(mod, "get_version", lambda _: "0.5.14")
         runner = types.SimpleNamespace(
             server_args=types.SimpleNamespace(
                 cuda_graph_config=types.SimpleNamespace(
@@ -212,8 +214,9 @@ class TestDsaCudaGraph:
         assert mod._generation_cuda_graph_enabled_for_tokens(runner, 4)
         assert not mod._generation_cuda_graph_enabled_for_tokens(runner, 8)
 
-    def test_generation_cuda_graph_can_be_disabled(self):
+    def test_generation_cuda_graph_can_be_disabled(self, monkeypatch):
         mod = _import_module()
+        monkeypatch.setattr(mod, "get_version", lambda _: "0.5.14")
         runner = types.SimpleNamespace(
             server_args=types.SimpleNamespace(
                 cuda_graph_config=types.SimpleNamespace(

@@ -42,6 +42,7 @@ pub fn engine_seed_offset(identity: RankIdentity) -> Result<u64> {
 pub struct SchedulerRank {
     core: EngineCore,
     handoff_requests: HashMap<HandoffId, Uuid>,
+    sync_speculative_prefill: bool,
 }
 
 impl SchedulerRank {
@@ -111,6 +112,9 @@ impl SchedulerRank {
         Ok(Self {
             core,
             handoff_requests: HashMap::new(),
+            sync_speculative_prefill: config.backend == Backend::Sglang
+                && identity.dp_size.get() > 1
+                && config.aic_nextn.is_some_and(|nextn| nextn > 0),
         })
     }
 
@@ -260,7 +264,29 @@ impl RankEngine for SchedulerRank {
         &mut self,
         now_ms: f64,
     ) -> Result<RankPass<Self::PassStartEffects, Self::PendingPass>> {
-        let pass = self.core.try_execute_hidden_pass(now_ms)?;
+        self.execute_group_pass(now_ms, false)
+    }
+
+    fn prepare_group_prefill(&mut self, _now_ms: f64) -> Result<bool> {
+        if self.sync_speculative_prefill
+            && let EngineCore::Sglang(core) = &mut self.core
+        {
+            return core.prepare_group_prefill();
+        }
+        Ok(false)
+    }
+
+    fn execute_group_pass(
+        &mut self,
+        now_ms: f64,
+        any_rank_prefilled: bool,
+    ) -> Result<RankPass<Self::PassStartEffects, Self::PendingPass>> {
+        let pass = match &mut self.core {
+            EngineCore::Sglang(core) if self.sync_speculative_prefill => {
+                core.try_execute_group_pass(now_ms, any_rank_prefilled)?
+            }
+            _ => self.core.try_execute_hidden_pass(now_ms)?,
+        };
         let end_ms = pass.end_ms;
         let (same_timestamp_retry, start_effects, completion_effects) = split_pass(pass)?;
         Ok(RankPass {

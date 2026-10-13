@@ -21,6 +21,18 @@ campaign workspace).
 
 # Preparation
 
+For an isolated campaign, `AISIM_COLLECTOR_CASES_ROOT=/absolute/path/to/cases`
+selects alternate `base_ops/` and `models/` declarations for both the planner
+and case generators, including spawned workers. Both directories must exist;
+an invalid override fails instead of falling back to repository cases. Set it
+before importing collector modules (the generators cache declarations).
+Without this variable the repository case directories remain the default.
+Capability floors, denylist and framework compatibility still use their normal
+sources; this override does not relax them. Keep a complete declaration snapshot
+because shared generator initialization also reads other architecture metadata.
+See the [GLM-5.2 campaign example](../../../examples/sweeper/README.md#本地-glm-52--b300-性能采集)
+for model-scoped configuration and output provenance.
+
 SGLang 0.5.14 standalone MLA rows distinguish kernel compute from KV storage.
 On B200/B300, `trtllm_mla` quantizes Q/K/V internally when the KV cache is FP8,
 so those rows use `mla_dtype=fp8, kv_cache_dtype=fp8`. On H200, the absorbed
@@ -263,6 +275,22 @@ per-family overrides. Resolution for a given `(framework, op)` walks
 per op, always. `families:` overrides require the op catalog
 (`op_backend_catalog.yaml`); without it, family-scoped pins fail closed rather
 than silently falling back to `default`.
+
+Exact `models:` entries take precedence for a selected `--model-path`.
+The `nvidia/GLM-5.2-NVFP4` local B300 campaign selects SGLang 0.5.19.
+Its GEMM, MoE and DSA version routes preserve the existing row schemas;
+the default stock runtime for other models remains unchanged.
+
+| Runtime field | Default | Behavior |
+| --- | --- | --- |
+| `execution` | `container` | `container` requires a declared image; `local_python` uses the calling Python interpreter and forbids image declarations. The exact installed framework version is still checked. |
+
+For `execution: local_python`, the table sidecar records the framework and
+runtime version without claiming a container image or digest. The local
+campaign's `runtime.json` records the Python executable and installed package
+versions; its other provenance files include source hashes.
+This supports collection in an existing conda environment; it does not install
+dependencies or publish the resulting tables to the packaged performance database.
 
 WideEP runtimes (`wideep_sglang`, `wideep_trtllm`) are flattened into peer
 framework entries rather than nested under a `wideep:` key, so the same

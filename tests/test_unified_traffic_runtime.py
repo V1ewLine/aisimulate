@@ -17,7 +17,7 @@ import pytest
 from aisimulate.compiler import prediction_to_replay_spec
 from aisimulate.config import CorePredictionConfig
 from aisimulate.replay.reporting import format_report_table
-from aisimulate.runner import EngineReplayRunnerFactory
+from aisimulate.runner import EngineReplayRunnerFactory, materialize_engine_launch_config
 from aisimulate.sweeper.replay import ReplayOutputRequirements
 
 _TRACE_FIXTURES = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces"
@@ -405,6 +405,126 @@ def test_engine_stack_runs_ordered_synthetic_sessions() -> None:
         ("session_1", 2),
     ]
     assert [row["input_length"] for row in records[:3]] == [8, 18, 28]
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+def test_sglang_prefill_budgets_reach_native_launch_for_each_role(mode):
+    engine = {**_engine(mode), "backend": "sglang"}
+    if mode == "disaggregated":
+        engine["kv_transfer"] = {"bytes_per_token": 1}
+    for index, worker in enumerate(engine["workers"].values(), start=1):
+        worker["parallelism"] = {"attention_data": 2}
+        worker["scheduler"] = {"chunked_prefill_size": 16 * index, "max_prefill_tokens": 64 * index}
+    deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
+    for index, role in enumerate(engine["workers"], start=1):
+        payload = getattr(deployment, f"{'agg' if role == 'aggregated' else role}_engine_args")
+        launch = materialize_engine_launch_config(
+            deployment.backend, deployment.backend_version, deployment.parallel_config, payload, role
+        )
+        assert launch["engine"]["sglang"]["chunked_prefill_size"] == 16 * index
+        assert launch["engine"]["sglang"]["max_prefill_tokens"] == 64 * index
+        assert launch["engine"]["max_num_batched_tokens"] == 8192
+        assert launch["engine"]["num_gpu_blocks"] == 128
+        assert launch["dp_size"] == 2
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [
+        {},
+        {"chunked_prefill_size": None, "max_prefill_tokens": None},
+        {"chunked_prefill_size": 8192, "max_prefill_tokens": 16384},
+    ],
+    ids=["omitted", "null", "explicit_native_defaults"],
+)
+def test_sglang_prefill_budget_defaults_preserve_long_prompt(budgets):
+    engine = {**_engine(), "backend": "sglang", "context_length": 32768}
+    worker = engine["workers"]["aggregated"]
+    worker["scheduler"] = budgets
+    worker["kv_cache"] = {
+        "block_size": 64,
+        "prefix_caching": False,
+        "capacity": {"type": "fixed", "blocks": 512},
+    }
+    config = {
+        "engine": engine,
+        "traffic": {
+            "source": {"type": "synthetic", "input_tokens": 24576, "output_tokens": 3},
+            "load": {"type": "concurrency", "concurrency": 1},
+            "stop": {"requests": 1},
+        },
+    }
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(config))
+    payload = spec.backend_deployment.agg_engine_args
+    if not any(value is not None for value in budgets.values()):
+        assert "sglang" not in payload
+    report = _run(config)
+    (record,) = report.metadata["native_report"]["per_request"]
+    assert report.metrics["completed_requests"] == 1
+    assert record["first_token_ms"] == pytest.approx(3.0)
+    assert record["input_length"] == 24576
+    assert record["output_length"] == 3
+
+
+@pytest.mark.parametrize("dp", [1, 2])
+@pytest.mark.parametrize("chunk", [8, 16])
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+def test_sglang_chunk_budget_changes_prefill_passes(mode, chunk, dp):
+    engine = {**_engine(mode), "backend": "sglang"}
+    role = "aggregated" if mode == "aggregated" else "prefill"
+    worker = engine["workers"][role]
+    worker["parallelism"] = {"attention_data": dp}
+    worker["scheduler"] = {"chunked_prefill_size": chunk}
+    worker["kv_cache"]["prefix_caching"] = False
+    if mode == "disaggregated":
+        engine["kv_transfer"] = {"bytes_per_token": 1, "bandwidth_gb_per_second": 1e9}
+    config = {
+        "engine": engine,
+        "traffic": {
+            "source": {"type": "synthetic", "input_tokens": 32, "output_tokens": 3},
+            "load": {"type": "concurrency", "concurrency": dp},
+            "stop": {"requests": dp},
+        },
+    }
+    report = _run(config)
+    records = report.metadata["native_report"]["per_request"]
+    assert report.metrics["completed_requests"] == dp
+    assert len(records) == dp
+    # Each prefill forward costs exactly 1 ms. DP divides the configured chunk
+    # once, and the two ranks advance together. Transfer time is negligible.
+    expected_ms = 32 / (chunk // dp)
+    if mode == "disaggregated":
+        assert [row["source_held_ms"] for row in records] == pytest.approx([expected_ms] * dp)
+        # P/D publishes the first output after the destination's first decode.
+        expected_ms += 1
+    assert [row["first_token_ms"] for row in records] == pytest.approx([expected_ms] * dp)
+    assert sum(row["input_length"] for row in records) == 32 * dp
+    assert sum(row["output_length"] for row in records) == 3 * dp
+
+
+@pytest.mark.parametrize("dp", [1, 2])
+@pytest.mark.parametrize("budget,expected_ms", [(4, [1, 2, 3]), (8, [1, 1, 2]), (16, [1, 1, 1])])
+def test_sglang_max_prefill_tokens_limits_batch_admission(budget, expected_ms, dp):
+    engine = {**_engine(), "backend": "sglang"}
+    worker = engine["workers"]["aggregated"]
+    worker["kv_cache"]["prefix_caching"] = False
+    worker["parallelism"] = {"attention_data": dp}
+    worker["scheduler"] = {"chunked_prefill_size": 16 * dp, "max_prefill_tokens": budget}
+    report = _run(
+        {
+            "engine": engine,
+            "traffic": {
+                "source": {"type": "synthetic", "input_tokens": 4, "output_tokens": 1},
+                "load": {"type": "concurrency", "concurrency": 3 * dp},
+                "stop": {"requests": 3 * dp},
+            },
+        }
+    )
+    records = report.metadata["native_report"]["per_request"]
+    assert report.metrics["completed_requests"] == 3 * dp
+    assert sorted(row["first_token_ms"] for row in records) == pytest.approx(sorted(expected_ms * dp))
+    assert sum(row["input_length"] for row in records) == 12 * dp
+    assert sum(row["output_length"] for row in records) == 3 * dp
 
 
 @pytest.mark.parametrize("interval", [None, 0, 2], ids=["default", "disabled", "two_rounds"])

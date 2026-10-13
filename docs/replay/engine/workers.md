@@ -44,6 +44,8 @@ engine:
 | `workers.<role>.parallelism.decode_context` | Unset (1) | predict only | Decode context parallelism (vLLM `-dcp`, SGLang `--dcp-size`). Must divide `tensor`; adds no GPUs. |
 | `workers.<role>.scheduler.max_batched_tokens` | `8192` | Prefill and aggregated: `{choices: [8192, 16384, 32768]}`; decode: fixed | Positive. Token budget for one scheduler pass on one attention-DP rank. See [SGLang note](#batch-limits). |
 | `workers.<role>.scheduler.max_sequences` | `256`; `1` for `prefill` | Prefill: `{choices: [1, 2, 4, 8, 16, 32, 64, 128, 256]}`; others: `{choices: [256, 512, 1024]}` | Positive. Maximum running requests on one attention-DP rank. |
+| `workers.<role>.scheduler.chunked_prefill_size` | Native SGLang default (`8192`) | predict only | Positive integer. SGLang prompt chunk budget before division by `attention_data`; see [SGLang prefill budgets](#sglang-prefill-budgets). |
+| `workers.<role>.scheduler.max_prefill_tokens` | Native SGLang default (`16384`) | predict only | Positive integer. SGLang page-rounded prefill-token budget per attention-DP rank; not divided by `attention_data`. |
 | `workers.<role>.scheduler.prefill_schedule_interval` | `1` | predict only | vLLM only. See [vLLM prefill schedule interval](#vllm-prefill-schedule-interval). |
 | `workers.<role>.scheduler.prefill_decode_interval` | `0` | predict only | SGLang only. See [SGLang prefill/decode interval](#sglang-prefilldecode-interval). |
 | `engine.enable_chunked_prefill` | Backend default (on) | fixed | Boolean. Applies to aggregated and prefill roles; `false` is rejected for SGLang and for AFD. |
@@ -120,15 +122,52 @@ how vLLM and SGLang apply them inside each DP engine. A prefill role defaults
 to `max_sequences: 1`, so each prefill rank runs one request at a time unless
 you raise it.
 
-> **SGLang note.** The SGLang scheduler currently takes its per-pass prefill
-> budget from SGLang's default `chunked_prefill_size` (8192 tokens, divided by
-> `attention_data`), not from `max_batched_tokens`. Changing
-> `max_batched_tokens` does not change SGLang replay results.
+For SGLang, the prefill scheduling budgets are `chunked_prefill_size` and
+`max_prefill_tokens`, described below. `max_batched_tokens` remains an input to
+activation-memory/KV-capacity estimation; it does not set either scheduling budget.
 
 With chunked prefill (the default), a long prompt is split across passes that
 each respect the token budget. With `enable_chunked_prefill: false` on vLLM, a
 prompt larger than `max_batched_tokens` can never be scheduled and the run
 fails. Keep `max_batched_tokens` at least as large as the longest prompt.
+
+### SGLang prefill budgets
+
+`predict` accepts both native budgets under each worker's `scheduler` block:
+
+```yaml
+engine:
+  backend: sglang
+  workers:
+    aggregated: # also supported on prefill / decode roles
+      scheduler:
+        chunked_prefill_size: 32768
+        max_prefill_tokens: 458752
+        max_batched_tokens: 32768
+```
+
+Merge this fragment into an existing prediction. Omitted or `null` budgets retain
+the native defaults, so existing YAMLs keep their scheduling behavior. These two
+fields are rejected for other backends and by `recommend`.
+
+The runtime divides `chunked_prefill_size` by `attention_data` once. For example,
+`32768` with DP=2 gives a `16384`-token chunk budget per rank. Supply the original
+worker value, not the divided value. `max_prefill_tokens` stays per rank. Both
+budgets limit prefill work across the batch; cached prefix tokens do not consume
+them, and a continued long prompt consumes another chunk on a later pass.
+
+Choose chunks aligned to the KV page size, including after DP division. For long
+prompts, keep `max_prefill_tokens` at least as large as the per-rank chunk budget:
+the scheduler rejects a selected chunk that exceeds the remaining prefill budget.
+Zero and negative values, including SGLang's negative disable-chunking sentinel,
+are not supported by this interface.
+
+These overrides do not automatically resize `max_batched_tokens`, change the
+memory fraction, or recalibrate activation/CUDA Graph memory. When capacity is
+estimated, set `max_batched_tokens` for the per-rank activation budget of the
+deployment being compared. Fixed KV capacity remains fixed. Changing a budget
+need not change latency when another limit or the workload already constrains
+the batch.
 
 <a id="vllm-prefill-schedule-interval"></a>
 
@@ -197,10 +236,15 @@ tokens, or is idle. Idle blocked rounds take zero modeled time. If any rank of
 the DP group ran prefill, every rank of the group is blocked, as in SGLang's
 synchronized DP attention. Received P/D handoffs can still start decoding.
 
+With speculative decoding (`engine.nextn > 0`) and attention DP above 1,
+Replay selects each rank's prefill work before advancing decode. If any rank
+prefills, peers without prefill run idle for that round and resume decode on a
+later round without prefill. Queued requests that cannot be admitted and fully
+cached zero-output requests do not force peers idle. This models SGLang's default
+speculative MLP synchronization; `speculative_skip_dp_mlp_sync` is not exposed.
+
 Not modeled: mixed-chunk forwards, SGLang's separate prefill delayer, CPU and
-collective overhead, and idle sleeping. In speculative DP attention, SGLang can
-force a peer rank idle while another rank prefills; Replay still lets that peer
-decode in the same round. Behavior follows SGLang at commit
+collective overhead, and idle sleeping. Interval behavior follows SGLang at commit
 [`20621aa`](https://github.com/sgl-project/sglang/blob/20621aa14bda7726a8a968f326198eac61717fef/python/sglang/srt/managers/scheduler.py#L1211).
 
 ### Backend scheduling differences

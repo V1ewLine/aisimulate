@@ -31,6 +31,7 @@ __compat__ = "sglang==0.5.14"
 
 import os
 import sys
+from importlib.metadata import version as get_version
 
 import torch
 
@@ -344,6 +345,12 @@ def _bench_glm5_topk(M, past_kv, isl, bs, *, topk, device):  # noqa: N803
 
     fused = _glm5_fuse_topk_enabled()
     kernel_src = "fast_topk_transform_fused" if fused else "fast_topk_v2"
+    use_topk_dispatch = get_version("sglang") == "0.5.19"
+    if use_topk_dispatch and fused and isl == 1:
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+
+        if DSATopKBackend.SGL_KERNEL.should_use_topk_v2():
+            kernel_src = "topk_transform_512_v2"
 
     # GLM-5 is uniform DSA (ratio=1): per-request full context = past_kv + isl.
     length_values, topk_offset_values, max_seqlen_k = _glm5_topk_metadata(bs, isl, past_kv)
@@ -448,6 +455,40 @@ def _bench_glm5_topk(M, past_kv, isl, bs, *, topk, device):  # noqa: N803
 
         def make_fn(score):
             return lambda: fast_topk_v2(score, lengths, topk)
+    elif use_topk_dispatch:
+        from types import SimpleNamespace
+
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend, TopkTransformMethod
+
+        # SGLang 0.5.19 dsa_backend.py:693-707, 1066-1073 builds a compact
+        # page table and preprocesses the plan once per forward. The top-k
+        # kernel timing excludes that per-forward metadata work, like serving
+        # reuse across layers. FP8 GLM DSA uses page_size=64.
+        page_size = 64
+        pages = (max_seqlen_k + page_size - 1) // page_size
+        real_page_table = torch.arange(M * pages, dtype=torch.int32, device=device).view(M, pages)
+        page_table_1 = (
+            real_page_table[:, :, None] * page_size + torch.arange(page_size, dtype=torch.int32, device=device)
+        ).reshape(M, -1)
+        backend = DSATopKBackend.SGL_KERNEL
+        metadata = SimpleNamespace(
+            real_page_table=real_page_table,
+            page_table_1=page_table_1,
+            page_size=page_size,
+            topk_v2_plan=plan_topk_v2(lengths) if backend.should_use_topk_v2() else None,
+        )
+        cu_seqlens_q = torch.arange(M + 1, dtype=torch.int32, device=device)
+
+        def make_fn(score):
+            return lambda: backend.topk_transform(
+                logits=score,
+                lengths=lengths,
+                topk=topk,
+                topk_transform_method=TopkTransformMethod.PAGED,
+                attn_metadata=metadata,
+                cu_seqlens_q_topk=cu_seqlens_q,
+            )
     else:
         pt = torch.arange(max_seqlen_k, dtype=torch.int32, device=device)
         page_table_size_1 = pt.view(1, max_seqlen_k).repeat(M, 1).contiguous()

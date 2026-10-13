@@ -1,0 +1,49 @@
+# 仅采集 GLM-5.2 NVFP4 / B300 / 单机共置需要的算子；相对路径以本文件所在目录为准。
+model:
+  id: nvidia/GLM-5.2-NVFP4
+  config: /mnt/nvme/models/ZhipuAI/GLM-5.2-NVFP4/config.json
+  kv_cache_dtype: fp8
+hardware: b300_sxm
+output_dir: ../../../../out/local_perf
+# all 或 [gemm]、[moe, attention]、[communication] 等。
+categories: all
+runtime:
+  expected_sglang_version: '0.5.19' # 已适配本地 GLM-5.2 NVFP4 / B300 采集；必须与实际安装版本一致。
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+parallelism:
+  num_gpus: 8
+  attention_tp_sizes: [1, 2, 4, 8] # 对应 attention DP=8,4,2,1；CP=1。
+  moe_ep_sizes: [1, 2, 4, 8]       # 对应 MoE TP=8,4,2,1。
+sweeps:
+  # token 数是每次算子调用的输入规模，不是请求总数。
+  gemm_tokens: [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+  moe_tokens: [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+  moe_balanced: true
+  moe_power_law_alphas: [1.01]
+  attention:
+    context_batch_sizes: [1, 2, 4, 8]
+    context_sequence_lengths: [128, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    prefix_lengths: [0, 19968, 32768]
+    generation_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 96, 128]
+    generation_sequence_lengths: [1024, 8192, 16384, 32768, 65536]
+    context_max_tokens: 131072
+    generation_max_tokens: 8388608 # batch * KV 长度的采集上限，不是 serving 的 max_prefill_tokens。
+communication:
+  collectors: [nccl, custom_allreduce]
+  nccl_ops: [all_reduce, all_gather, reduce_scatter]
+  nccl_tests_dir: null # nccl-tests/build 路径；null 时从 PATH 查找 *_perf 可执行文件。
+  message_sizes:
+    min_bytes: 512
+    max_bytes_exclusive: 536870913
+    factor: 2
+collection:
+  smoke: false     # 仅作用于算子采集；通信仍按 message_sizes 扫描。
+  limit: null      # 每个算子的顶层 case 数上限；一个 attention case 内还会扫多个形状。
+  shuffle: false
+  measure_power: false
+  power_test_duration_sec: 1.0
+  profile: false
+  debug: false
+  keep_csv: false  # 算子默认输出 parquet；独立通信接口保留原始 *_perf.txt CSV。
+  timeout_seconds: 86400 # 每个采集任务的超时；超时结束整组子进程。
+  continue_on_error: true

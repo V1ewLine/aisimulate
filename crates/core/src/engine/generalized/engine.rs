@@ -238,6 +238,16 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
         for rank in &mut self.ranks {
             rank.prepare_group_pass(wave_step, self.dp_size);
         }
+        let mut group_prefill = false;
+        for dp_rank in 0..self.ranks.len() {
+            let rank = &mut self.ranks[dp_rank];
+            if rank.is_ready() && !rank.waiting_for_external_command() {
+                let prefill = rank
+                    .prepare_group_prefill(now_ms)
+                    .with_context(|| format!("preparing attention-DP rank {dp_rank}"));
+                group_prefill |= prefill.map_err(|error| self.poison(error))?;
+            }
+        }
         for dp_rank in 0..self.ranks.len() {
             if !self.ranks[dp_rank].is_ready() || self.ranks[dp_rank].waiting_for_external_command()
             {
@@ -245,7 +255,7 @@ impl<C: RankEngine> GeneralizedMockerEngine<C> {
             }
             let pass = {
                 let rank = &mut self.ranks[dp_rank];
-                rank.execute_pass(now_ms)
+                rank.execute_group_pass(now_ms, group_prefill)
                     .with_context(|| format!("executing attention-DP rank {dp_rank}"))
                     .and_then(|pass| {
                         validate_time(pass.end_ms, "rank pass end time")?;

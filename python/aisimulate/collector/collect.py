@@ -2179,7 +2179,7 @@ def collect_ops(
             perf_filename = collection["perf_filename"]
             worker_filename = collection.get("worker_perf_filename")
             if worker_filename is not None:
-                perf_filename = str(Path(perf_filename).with_name(worker_filename))
+                perf_filename = str(Path(perf_filename).with_name(str(worker_filename)))
             run_func = functools.partial(run_func, perf_filename=perf_filename)
 
             def get_func_with_limit(get_func=get_func, op=collection["type"]):
@@ -2592,10 +2592,14 @@ def _split_image_digest(image_ref: str) -> tuple[str, str | None]:
 
 def _runtime_metadata(provenance_ctx: dict) -> dict:
     runtime = provenance_ctx["runtime"]
-    image, image_digest = _split_image_digest(runtime.image())
-    runtime_meta = {"framework": runtime.framework, "version": runtime.version, "image": image}
-    if image_digest:
-        runtime_meta["image_digest"] = image_digest
+    runtime_meta = {"framework": runtime.framework, "version": runtime.version}
+    # The existing sidecar schema has no Python-interpreter field. Local
+    # campaigns record that in runtime.json and must not invent an image.
+    if runtime.execution != "local_python":
+        image, image_digest = _split_image_digest(runtime.image())
+        runtime_meta["image"] = image
+        if image_digest:
+            runtime_meta["image_digest"] = image_digest
     if runtime.source_commit:
         runtime_meta["source_commit"] = runtime.source_commit
     if runtime.abi:

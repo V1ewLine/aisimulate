@@ -19,9 +19,11 @@ from typing import Optional
 
 import yaml
 
+from collector.case_paths import collection_case_root
+
 COLLECTOR_ROOT = Path(__file__).resolve().parent
-BASE_OP_CASES_DIR = COLLECTOR_ROOT / "cases" / "base_ops"
-MODEL_CASES_DIR = COLLECTOR_ROOT / "cases" / "models"
+BASE_OP_CASES_DIR = collection_case_root() / "base_ops"
+MODEL_CASES_DIR = collection_case_root() / "models"
 
 # Backend names a model_case_values row may target via `frameworks:`. A typo
 # here would otherwise silently exclude the row from its intended backend.

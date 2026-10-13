@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# Analytical search via `aiconfigurator cli exp`; no trace input is required.
+# SGLang 0.5.17, K=1000, ISL=total input, fixed cached prefix per request.
+# Assumes unconditional positional acceptance rates 0.148/0.093/0.056.
+# See README.md for parameter meanings and validation scope.
+
+glm52_b300_case2:
+  serving_mode: agg
+  model_path: nvidia/GLM-5.2-NVFP4
+  system_name: b300_sxm
+  backend_name: sglang
+  backend_version: "0.5.17"     # Match the SGLang version used in the experiment.
+  total_gpus: 8
+  database_mode: SILICON
+  forward_model: op_level
+
+  isl: 32000
+  osl: 300
+  prefix: 19200                 # Already-cached tokens; still part of ISL.
+  nextn: 3
+  nextn_accepted: 0.297         # Sum of unconditional positional acceptance rates.
+
+  ttft: 15000                  # Estimated TTFT limit in ms, NOT a P50 constraint.
+  tpot: 33                     # Estimated TPOT limit in ms, NOT a P50 constraint.
+  pareto_sweep: false
+  enable_chunked_prefill: true  # Search analytical ctx_tokens budgets; not a native chunk-size list.
+
+  agg_num_gpu_candidates: [1, 2, 4, 8]
+  agg_tp_candidates: [1, 2, 4, 8]
+  agg_pp_candidates: [1]
+  agg_dp_candidates: [1, 2, 4, 8]
+  agg_moe_tp_candidates: [1, 2, 4, 8]
+  agg_moe_ep_candidates: [1, 2, 4, 8]
+  agg_cp_candidates: [1, 2, 4, 8]
+
+  # Quantization is inferred from checkpoint metadata; inspect resolved settings
+  # and match the actual serving deployment before comparing predictions.

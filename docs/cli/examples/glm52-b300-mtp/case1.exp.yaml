@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+# Analytical search via `aiconfigurator cli exp`; no trace input is required.
+# SGLang 0.5.17, K=1000, ISL=total input, fixed cached prefix per request.
+# Assumes unconditional positional acceptance rates 0.498/0.345/0.267.
+# See README.md for parameter meanings and validation scope.
+
+glm52_b300_case1:
+  serving_mode: agg
+  model_path: nvidia/GLM-5.2-NVFP4
+  system_name: b300_sxm
+  backend_name: sglang
+  backend_version: "0.5.17"     # Match the SGLang version used in the experiment.
+  total_gpus: 8
+  database_mode: SILICON
+  forward_model: op_level
+
+  isl: 100000
+  osl: 1000
+  prefix: 90000                 # Already-cached tokens; still part of ISL.
+  # nextn: 3                     # Draft length, not the checkpoint's layer count.
+  # nextn_accepted: 1.11          # Sum of unconditional positional acceptance rates.
+
+  ttft: 15000                  # Estimated TTFT limit in ms, NOT a P50 constraint.
+  tpot: 33                     # Estimated TPOT limit in ms, NOT a P50 constraint.
+  pareto_sweep: false           # Search this TPOT target, not the default TPOT grid.
+  enable_chunked_prefill: true  # Search analytical ctx_tokens budgets; not a native chunk-size list.
+
+  # Worker shapes; the picker replicates feasible workers within the 8-GPU budget.
+  # Aggregated search, PP=1; jointly enumerate legal TP/DP/MoE/CP layouts.
+  agg_num_gpu_candidates: [1, 2, 4, 8]
+  agg_tp_candidates: [1, 2, 4, 8]
+  agg_pp_candidates: [1]
+  agg_dp_candidates: [1, 2, 4, 8]
+  agg_moe_tp_candidates: [1, 2, 4, 8]
+  agg_moe_ep_candidates: [1, 2, 4, 8]
+  agg_cp_candidates: [1, 2, 4, 8]
+
+  # Quantization is inferred from the checkpoint metadata. Do not infer KV
+  # precision from the NVFP4 model name; this YAML does not validate KVV error.

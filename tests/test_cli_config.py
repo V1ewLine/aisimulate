@@ -100,6 +100,8 @@ def test_prediction_scheduler_defaults_are_role_aware() -> None:
     assert aggregated.engine.workers.aggregated.scheduler.max_sequences == 256
     assert aggregated.engine.workers.aggregated.scheduler.prefill_schedule_interval == 1
     assert aggregated.engine.workers.aggregated.scheduler.prefill_decode_interval == 0
+    assert aggregated.engine.workers.aggregated.scheduler.chunked_prefill_size is None
+    assert aggregated.engine.workers.aggregated.scheduler.max_prefill_tokens is None
 
     disaggregated = CorePredictionConfig.model_validate(
         {
@@ -146,6 +148,47 @@ def test_prediction_accepts_sglang_prefill_decode_interval(value: int) -> None:
 
     assert config.engine.workers.aggregated.scheduler.prefill_decode_interval == value
     assert config.engine.workers.aggregated.scheduler.prefill_schedule_interval == 1
+
+
+@pytest.mark.parametrize("role", ["aggregated", "prefill", "decode"])
+def test_prediction_sglang_prefill_budgets_survive_serialization(role: str) -> None:
+    engine = {**_engine(), "backend": "sglang"}
+    if role != "aggregated":
+        engine.update(mode="disaggregated", workers={"prefill": {}, "decode": {}})
+    budgets = {"chunked_prefill_size": 32768, "max_prefill_tokens": 458752}
+    engine["workers"][role]["scheduler"] = budgets
+    config = CorePredictionConfig.model_validate({"engine": engine})
+    restored = CorePredictionConfig.model_validate_json(config.model_dump_json(exclude_none=True))
+    scheduler = getattr(restored.engine.workers, role).scheduler
+    assert scheduler.chunked_prefill_size == 32768
+    assert scheduler.max_prefill_tokens == 458752
+    assert scheduler.max_batched_tokens == 8192
+
+
+@pytest.mark.parametrize("field", ["chunked_prefill_size", "max_prefill_tokens"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "8192", {"choices": [8192, 16384]}])
+def test_prediction_rejects_invalid_sglang_prefill_budget(field, value):
+    engine = {**_engine(), "backend": "sglang"}
+    engine["workers"]["aggregated"]["scheduler"] = {field: value}
+    with pytest.raises(ValidationError, match=field):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("backend", ["vllm", "trtllm"])
+@pytest.mark.parametrize("field", ["chunked_prefill_size", "max_prefill_tokens"])
+def test_prediction_rejects_sglang_prefill_budget_on_other_backends(backend, field):
+    engine = {**_engine(), "backend": backend}
+    engine["workers"]["aggregated"]["scheduler"] = {field: 8192}
+    with pytest.raises(ValidationError, match=rf"scheduler.{field}.*backend=sglang"):
+        CorePredictionConfig.model_validate({"engine": engine})
+
+
+@pytest.mark.parametrize("field", ["chunked_prefill_size", "max_prefill_tokens"])
+def test_recommendation_rejects_predict_only_sglang_prefill_budget(field):
+    engine = {**_engine(), "backend": "sglang"}
+    engine["workers"]["aggregated"]["scheduler"] = {field: 8192}
+    with pytest.raises(ValidationError, match=field):
+        CoreRecommendationConfig.model_validate({"engine": engine, "optimization": {"target": "throughput"}})
 
 
 @pytest.mark.parametrize("value", [-1, 1.5, True, "20"])

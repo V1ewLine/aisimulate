@@ -175,6 +175,22 @@ def required_prefill_extend_tokens(batch_size: int, seq_len: int) -> int:
 
 
 def runtime_chunk_size(model_runner) -> int:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        current_version = version("sglang")
+    except PackageNotFoundError:
+        current_version = None
+    if current_version == "0.5.19":
+        # 0.5.19 scheduler reads the resolved RuntimeContext schedule bag;
+        # raw ServerArgs retains None for framework-chosen defaults.
+        # sglang/srt/managers/scheduler.py (0.5.19): get_schedule().chunked_prefill_size.
+        from sglang.srt.runtime_context import get_schedule
+
+        sglang_chunk = get_schedule().chunked_prefill_size
+        if isinstance(sglang_chunk, int) and sglang_chunk > 0:
+            return sglang_chunk
+        raise RuntimeError("SGLang did not initialize schedule.chunked_prefill_size")
     server_args = getattr(model_runner, "server_args", None)
     sglang_chunk = getattr(server_args, "chunked_prefill_size", None) if server_args else None
     if isinstance(sglang_chunk, int) and sglang_chunk > 0:
